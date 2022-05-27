@@ -176,7 +176,7 @@ impl<C: RetryClientTrait> RegionCache<C> {
             if end_key.is_empty() {
                 cache.key_to_ver_id.range(..)
             } else {
-                cache.key_to_ver_id.range(..end_key)
+                cache.key_to_ver_id.range(..=end_key)
             }
         };
         while let Some((_, ver_id_in_cache)) = search_range.next_back() {
@@ -209,9 +209,11 @@ impl<C: RetryClientTrait> RegionCache<C> {
         let mut cache = self.region_cache.write().await;
         let region_entry = cache
             .ver_id_to_region
-            .get_mut(&ver_id)
-            .ok_or(Error::EntryNotFoundInRegionCache)?;
-        region_entry.leader = Some(leader);
+            .get_mut(&ver_id);
+        if let Some(region) = region_entry {
+            region.leader = Some(leader);
+        }
+        
         Ok(())
     }
 

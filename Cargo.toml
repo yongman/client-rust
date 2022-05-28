@@ -19,6 +19,7 @@ name = "tikv_client"
 
 [dependencies]
 async-trait = "0.1"
+chrono = "0.4"
 derive-new = "0.5"
 either = "1.6"
 fail = "0.4"

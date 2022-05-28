@@ -12,11 +12,11 @@ use std::{
 use tikv_client_common::Error;
 use tikv_client_pd::Cluster;
 use tikv_client_proto::metapb::{self, Store};
-use tokio::sync::{Notify, RwLock};
+use tokio::sync::{Notify, RwLock, RwLockReadGuard};
 
 const MAX_RETRY_WAITING_CONCURRENT_REQUEST: usize = 4;
 
-struct RegionCacheMap {
+pub struct RegionCacheMap {
     /// RegionVerID -> Region. It stores the concrete region caches.
     /// RegionVerID is the unique identifer of a region *across time*.
     // TODO: does it need TTL?
@@ -116,6 +116,37 @@ impl<C: RetryClientTrait> RegionCache<C> {
         )))
     }
 
+    // Retrieve cache entry by RegionId. If there's no entry, query PD and update cache.
+    pub async fn get_region_by_ver_id(&self, ver_id: RegionVerId) -> Result<RegionWithLeader> {
+        for _ in 0..=MAX_RETRY_WAITING_CONCURRENT_REQUEST {
+            let region_cache_guard = self.region_cache.read().await;
+
+            // check cache
+            let region = region_cache_guard.ver_id_to_region.get(&ver_id);
+            if region.is_some() {
+                return Ok(region.unwrap().clone());
+            }
+
+            let id = region.unwrap().id();
+
+            // check concurrent requests
+            let notify = region_cache_guard.on_my_way_id.get(&id).cloned();
+            let notified = notify.as_ref().map(|notify| notify.notified());
+            drop(region_cache_guard);
+
+            if let Some(n) = notified {
+                n.await;
+                continue;
+            } else {
+                return self.read_through_region_by_id(id).await;
+            }
+        }
+        Err(Error::StringError(format!(
+            "Concurrent PD requests failed for {} times",
+            MAX_RETRY_WAITING_CONCURRENT_REQUEST
+        )))
+    }
+
     pub async fn get_store_by_id(&self, id: StoreId) -> Result<Store> {
         let store = self.store_cache.read().await.get(&id).cloned();
         match store {
@@ -176,7 +207,7 @@ impl<C: RetryClientTrait> RegionCache<C> {
             if end_key.is_empty() {
                 cache.key_to_ver_id.range(..)
             } else {
-                cache.key_to_ver_id.range(..=end_key)
+                cache.key_to_ver_id.range(..end_key)
             }
         };
         while let Some((_, ver_id_in_cache)) = search_range.next_back() {
@@ -207,13 +238,11 @@ impl<C: RetryClientTrait> RegionCache<C> {
         leader: metapb::Peer,
     ) -> Result<()> {
         let mut cache = self.region_cache.write().await;
-        let region_entry = cache
-            .ver_id_to_region
-            .get_mut(&ver_id);
+        let region_entry = cache.ver_id_to_region.get_mut(&ver_id);
         if let Some(region) = region_entry {
             region.leader = Some(leader);
         }
-        
+
         Ok(())
     }
 
@@ -227,6 +256,10 @@ impl<C: RetryClientTrait> RegionCache<C> {
             cache.id_to_ver_id.remove(&id);
             cache.key_to_ver_id.remove(&start_key);
         }
+    }
+
+    pub async fn read_guard_region_cache(&self) -> RwLockReadGuard<'_, RegionCacheMap> {
+        self.region_cache.read().await
     }
 }
 

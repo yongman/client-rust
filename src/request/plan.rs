@@ -2,16 +2,10 @@
 
 use std::{marker::PhantomData, sync::Arc};
 
-use async_recursion::async_recursion;
-use async_trait::async_trait;
-use futures::{future::try_join_all, prelude::*};
-use tikv_client_proto::{errorpb, errorpb::EpochNotMatch, kvrpcpb};
-use tikv_client_store::{HasKeyErrors, HasRegionError, HasRegionErrors, KvClient};
-use tokio::sync::Semaphore;
-
 use crate::{
     backoff::Backoff,
     pd::PdClient,
+    region::RegionWithLeader,
     request::{KvRequest, Shardable},
     stats::tikv_stats,
     store::RegionStore,
@@ -19,6 +13,15 @@ use crate::{
     util::iter::FlatMapOkIterExt,
     Error, Result,
 };
+use async_recursion::async_recursion;
+use async_trait::async_trait;
+use chrono::offset::Utc;
+use chrono::DateTime;
+use futures::{future::try_join_all, prelude::*};
+use std::time::SystemTime;
+use tikv_client_proto::{errorpb, errorpb::EpochNotMatch, kvrpcpb, metapb};
+use tikv_client_store::{HasKeyErrors, HasRegionError, HasRegionErrors, KvClient};
+use tokio::sync::Semaphore;
 
 /// A plan for how to execute a request. A user builds up a plan with various
 /// options, then exectutes it.
@@ -71,6 +74,12 @@ pub struct RetryableMultiRegion<P: Plan, PdC: PdClient> {
     pub preserve_region_results: bool,
 }
 
+fn time_prefix() -> String {
+    let system_time = SystemTime::now();
+    let datetime: DateTime<Utc> = system_time.into();
+    datetime.format("%d/%m/%Y %T%.3f").to_string()
+}
+
 impl<P: Plan + Shardable, PdC: PdClient> RetryableMultiRegion<P, PdC>
 where
     P::Result: HasKeyErrors + HasRegionError,
@@ -84,6 +93,7 @@ where
         permits: Arc<Semaphore>,
         preserve_region_results: bool,
     ) -> Result<<Self as Plan>::Result> {
+        // Add region cache read guard
         let shards = current_plan.shards(&pd_client).collect::<Vec<_>>().await;
         let mut handles = Vec::new();
         for shard in shards {
@@ -136,6 +146,13 @@ where
         drop(permit);
 
         if let Some(e) = resp.key_errors() {
+            let ver_id = region_store.region_with_leader.ver_id();
+            println!(
+                "{} key_error, region_ver_id:{:?} error {:?}",
+                time_prefix(),
+                ver_id,
+                e
+            );
             Ok(vec![Err(Error::MultipleKeyErrors(e))])
         } else if let Some(e) = resp.region_error() {
             match backoff.next_delay_duration() {
@@ -173,8 +190,19 @@ where
     ) -> Result<bool> {
         let ver_id = region_store.region_with_leader.ver_id();
         if e.has_not_leader() {
+            println!(
+                "{} region_error, region_ver_id:{:?} not_leader",
+                time_prefix(),
+                ver_id
+            );
             let not_leader = e.get_not_leader();
             if not_leader.has_leader() {
+                println!(
+                    "{} region_error, region_ver_id:{:?} not_leader, real_leader:{:?}",
+                    time_prefix(),
+                    ver_id,
+                    not_leader.get_leader().clone()
+                );
                 match pd_client
                     .update_leader(
                         region_store.region_with_leader.ver_id(),
@@ -197,9 +225,21 @@ where
                 Ok(false)
             }
         } else if e.has_store_not_match() {
+            println!(
+                "{} region_error, region_ver_id:{:?} store_not_match:{:?}",
+                time_prefix(),
+                ver_id,
+                e.get_store_not_match()
+            );
             pd_client.invalidate_region_cache(ver_id).await;
             Ok(false)
         } else if e.has_epoch_not_match() {
+            println!(
+                "{} region_error, region_ver_id:{:?} epoch_not_match:{:?}",
+                time_prefix(),
+                ver_id,
+                e.get_epoch_not_match()
+            );
             Self::on_region_epoch_not_match(
                 pd_client.clone(),
                 region_store,
@@ -207,6 +247,12 @@ where
             )
             .await
         } else if e.has_stale_command() || e.has_region_not_found() {
+            println!(
+                "{} region_error, region_ver_id:{:?} stale_command or region_not_found:{:?}",
+                time_prefix(),
+                ver_id,
+                e
+            );
             pd_client.invalidate_region_cache(ver_id).await;
             Ok(false)
         } else if e.has_server_is_busy()
@@ -217,6 +263,12 @@ where
         } else {
             // TODO: pass the logger around
             // info!("unknwon region error: {:?}", e);
+            println!(
+                "{} region_error, region_ver_id:{:?} other:{:?}",
+                time_prefix(),
+                ver_id,
+                e
+            );
             pd_client.invalidate_region_cache(ver_id).await;
             Ok(false)
         }
@@ -233,6 +285,11 @@ where
     ) -> Result<bool> {
         let ver_id = region_store.region_with_leader.ver_id();
         if error.get_current_regions().is_empty() {
+            println!(
+                "{} region_error, region_ver_id:{:?} epoch_not_match, get_current_regions empty",
+                time_prefix(),
+                ver_id
+            );
             pd_client.invalidate_region_cache(ver_id).await;
             return Ok(true);
         }
@@ -254,12 +311,61 @@ where
 
                 // Find whether the current region is ahead of TiKV's. If so, backoff.
                 if returned_conf_ver < current_conf_ver || returned_version < current_version {
+                    println!(
+                        "{} region_error, region_ver_id:{:?} epoch_not_match, returned_conf_ver {:?}, current_conf_ver {:?}, returned_version {:?}, current_version {:?}",
+                        time_prefix(),
+                        ver_id,
+                        returned_conf_ver,
+                        current_conf_ver,
+                        returned_version,
+                        current_version
+                    );
                     return Ok(false);
                 }
             }
         }
-        // TODO: finer grained processing
-        pd_client.invalidate_region_cache(ver_id).await;
+
+        let mut new_regions = vec![];
+        let store_id = region_store.region_with_leader.get_store_id()?;
+        for r in error.get_current_regions() {
+            let peer: Vec<metapb::Peer> = r
+                .get_peers()
+                .iter()
+                .filter(|p| p.get_store_id() == store_id)
+                .cloned()
+                .collect();
+
+            let leader = if peer.is_empty() {
+                None
+            } else {
+                Some(peer[0].clone())
+            };
+
+            let new_region_with_leader = RegionWithLeader {
+                region: r.clone(),
+                leader,
+            };
+            new_regions.push(new_region_with_leader);
+        }
+
+        println!(
+            "{} region_error, region_ver_id:{:?} epoch_not_match, invalidate it, add new {:?}",
+            time_prefix(),
+            ver_id,
+            new_regions
+        );
+
+        pd_client.invalidate_region_cache(ver_id.clone()).await;
+        // Add new regions
+        for new_region in new_regions {
+            pd_client.add_region(new_region).await;
+        }
+        println!(
+            "{} region_error, region_ver_id:{:?} epoch_not_match, invalidate it, add new done",
+            time_prefix(),
+            ver_id
+        );
+
         Ok(false)
     }
 }

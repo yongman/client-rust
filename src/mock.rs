@@ -7,7 +7,8 @@
 
 use crate::{
     pd::{PdClient, PdRpcClient, RetryClient},
-    region::{RegionId, RegionWithLeader},
+    region::{RegionId, RegionVerId, RegionWithLeader},
+    region_cache::RegionCacheMap,
     store::RegionStore,
     Config, Error, Key, Result, Timestamp,
 };
@@ -17,6 +18,7 @@ use slog::{Drain, Logger};
 use std::{any::Any, sync::Arc};
 use tikv_client_proto::metapb;
 use tikv_client_store::{KvClient, KvConnect, Request};
+use tokio::sync::RwLockReadGuard;
 
 /// Create a `PdRpcClient` with it's internals replaced with mocks so that the
 /// client can be tested without doing any RPC calls.
@@ -171,13 +173,8 @@ impl PdClient for MockPdClient {
         Ok(region)
     }
 
-    async fn region_for_id(&self, id: RegionId) -> Result<RegionWithLeader> {
-        match id {
-            1 => Ok(Self::region1()),
-            2 => Ok(Self::region2()),
-            3 => Ok(Self::region3()),
-            _ => Err(Error::RegionNotFoundInResponse { region_id: id }),
-        }
+    async fn region_for_ver_id(&self, _ver_id: RegionVerId) -> Result<RegionWithLeader> {
+        unimplemented!()
     }
 
     async fn get_timestamp(self: Arc<Self>) -> Result<Timestamp> {
@@ -197,4 +194,10 @@ impl PdClient for MockPdClient {
     }
 
     async fn invalidate_region_cache(&self, _ver_id: crate::region::RegionVerId) {}
+
+    async fn add_region(&self, _region: RegionWithLeader) {}
+
+    async fn region_read_guard(&self) -> RwLockReadGuard<RegionCacheMap> {
+        todo!()
+    }
 }

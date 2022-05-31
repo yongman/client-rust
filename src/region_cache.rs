@@ -116,7 +116,7 @@ impl<C: RetryClientTrait> RegionCache<C> {
         )))
     }
 
-    // Retrieve cache entry by RegionId. If there's no entry, query PD and update cache.
+    // Retrieve cache entry by RegionVerId. If there's no entry, query PD and update cache.
     pub async fn get_region_by_ver_id(&self, ver_id: RegionVerId) -> Result<RegionWithLeader> {
         for _ in 0..=MAX_RETRY_WAITING_CONCURRENT_REQUEST {
             let region_cache_guard = self.region_cache.read().await;

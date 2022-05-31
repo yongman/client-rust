@@ -190,19 +190,8 @@ where
     ) -> Result<bool> {
         let ver_id = region_store.region_with_leader.ver_id();
         if e.has_not_leader() {
-            println!(
-                "{} region_error, region_ver_id:{:?} not_leader",
-                time_prefix(),
-                ver_id
-            );
             let not_leader = e.get_not_leader();
             if not_leader.has_leader() {
-                println!(
-                    "{} region_error, region_ver_id:{:?} not_leader, real_leader:{:?}",
-                    time_prefix(),
-                    ver_id,
-                    not_leader.get_leader().clone()
-                );
                 match pd_client
                     .update_leader(
                         region_store.region_with_leader.ver_id(),
@@ -225,21 +214,9 @@ where
                 Ok(false)
             }
         } else if e.has_store_not_match() {
-            println!(
-                "{} region_error, region_ver_id:{:?} store_not_match:{:?}",
-                time_prefix(),
-                ver_id,
-                e.get_store_not_match()
-            );
             pd_client.invalidate_region_cache(ver_id).await;
             Ok(false)
         } else if e.has_epoch_not_match() {
-            println!(
-                "{} region_error, region_ver_id:{:?} epoch_not_match:{:?}",
-                time_prefix(),
-                ver_id,
-                e.get_epoch_not_match()
-            );
             Self::on_region_epoch_not_match(
                 pd_client.clone(),
                 region_store,
@@ -285,11 +262,6 @@ where
     ) -> Result<bool> {
         let ver_id = region_store.region_with_leader.ver_id();
         if error.get_current_regions().is_empty() {
-            println!(
-                "{} region_error, region_ver_id:{:?} epoch_not_match, get_current_regions empty",
-                time_prefix(),
-                ver_id
-            );
             pd_client.invalidate_region_cache(ver_id).await;
             return Ok(true);
         }
@@ -311,60 +283,12 @@ where
 
                 // Find whether the current region is ahead of TiKV's. If so, backoff.
                 if returned_conf_ver < current_conf_ver || returned_version < current_version {
-                    println!(
-                        "{} region_error, region_ver_id:{:?} epoch_not_match, returned_conf_ver {:?}, current_conf_ver {:?}, returned_version {:?}, current_version {:?}",
-                        time_prefix(),
-                        ver_id,
-                        returned_conf_ver,
-                        current_conf_ver,
-                        returned_version,
-                        current_version
-                    );
                     return Ok(false);
                 }
             }
         }
 
-        let mut new_regions = vec![];
-        let store_id = region_store.region_with_leader.get_store_id()?;
-        for r in error.get_current_regions() {
-            let peer: Vec<metapb::Peer> = r
-                .get_peers()
-                .iter()
-                .filter(|p| p.get_store_id() == store_id)
-                .cloned()
-                .collect();
-
-            let leader = if peer.is_empty() {
-                None
-            } else {
-                Some(peer[0].clone())
-            };
-
-            let new_region_with_leader = RegionWithLeader {
-                region: r.clone(),
-                leader,
-            };
-            new_regions.push(new_region_with_leader);
-        }
-
-        println!(
-            "{} region_error, region_ver_id:{:?} epoch_not_match, invalidate it, add new {:?}",
-            time_prefix(),
-            ver_id,
-            new_regions
-        );
-
         pd_client.invalidate_region_cache(ver_id.clone()).await;
-        // Add new regions
-        for new_region in new_regions {
-            pd_client.add_region(new_region).await;
-        }
-        println!(
-            "{} region_error, region_ver_id:{:?} epoch_not_match, invalidate it, add new done",
-            time_prefix(),
-            ver_id
-        );
 
         Ok(false)
     }

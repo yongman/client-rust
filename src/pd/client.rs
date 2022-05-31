@@ -70,7 +70,7 @@ pub trait PdClient: Send + Sync + 'static {
     fn group_keys_by_region<K, K2>(
         self: Arc<Self>,
         keys: impl Iterator<Item = K> + Send + Sync + 'static,
-    ) -> BoxStream<'static, Result<(RegionVerId, Vec<K2>)>>
+    ) -> BoxStream<'static, Result<(RegionWithLeader, Vec<K2>)>>
     where
         K: AsRef<Key> + Into<K2> + Send + Sync + 'static,
         K2: Send + Sync + 'static,
@@ -89,7 +89,7 @@ pub trait PdClient: Send + Sync + 'static {
                         }
                         grouped.push(keys.next().unwrap().into());
                     }
-                    Ok(Some((keys, (ver_id, grouped))))
+                    Ok(Some((keys, (region, grouped))))
                 } else {
                     Ok(None)
                 }
@@ -133,7 +133,7 @@ pub trait PdClient: Send + Sync + 'static {
     fn group_ranges_by_region(
         self: Arc<Self>,
         mut ranges: Vec<kvrpcpb::KeyRange>,
-    ) -> BoxStream<'static, Result<(RegionVerId, Vec<kvrpcpb::KeyRange>)>> {
+    ) -> BoxStream<'static, Result<(RegionWithLeader, Vec<kvrpcpb::KeyRange>)>> {
         ranges.reverse();
         stream_fn(Some(ranges), move |ranges| {
             let this = self.clone();
@@ -147,7 +147,6 @@ pub trait PdClient: Send + Sync + 'static {
                     let start_key: Key = range.start_key.clone().into();
                     let end_key: Key = range.end_key.clone().into();
                     let region = this.region_for_key(&start_key).await?;
-                    let ver_id = region.ver_id();
                     let region_start = region.start_key();
                     let region_end = region.end_key();
                     let mut grouped = vec![];
@@ -160,7 +159,7 @@ pub trait PdClient: Send + Sync + 'static {
                             start_key: region_end.into(),
                             end_key: end_key.into(),
                         });
-                        return Ok(Some((Some(ranges), (ver_id, grouped))));
+                        return Ok(Some((Some(ranges), (region, grouped))));
                     }
                     grouped.push(range);
 
@@ -180,11 +179,11 @@ pub trait PdClient: Send + Sync + 'static {
                                 start_key: region_end.into(),
                                 end_key: end_key.into(),
                             });
-                            return Ok(Some((Some(ranges), (ver_id, grouped))));
+                            return Ok(Some((Some(ranges), (region, grouped))));
                         }
                         grouped.push(range);
                     }
-                    Ok(Some((Some(ranges), (ver_id, grouped))))
+                    Ok(Some((Some(ranges), (region, grouped))))
                 } else {
                     Ok(None)
                 }

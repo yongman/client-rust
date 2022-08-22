@@ -53,7 +53,7 @@ impl TimestampExt for Timestamp {
     }
 
     fn try_from_version(version: u64) -> Option<Self> {
-        if version == 0 {
+        if version == 0 || (version >= i64::MAX as u64 && version != u64::MAX) {
             None
         } else {
             Some(Self::from_version(version))

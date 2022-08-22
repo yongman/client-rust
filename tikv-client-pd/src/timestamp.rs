@@ -51,14 +51,17 @@ impl TimestampOracle {
         let (rpc_sender, rpc_receiver) = pd_client.tso()?;
 
         // Start a background thread to handle TSO requests and responses
-        thread::spawn(move || {
-            block_on(run_tso(
-                cluster_id,
-                rpc_sender.sink_err_into(),
-                rpc_receiver.err_into(),
-                request_rx,
-            ))
-        });
+        thread::Builder::new()
+            .name("tso-worker".to_owned())
+            .spawn(move || {
+                block_on(run_tso(
+                    cluster_id,
+                    rpc_sender.sink_err_into(),
+                    rpc_receiver.err_into(),
+                    request_rx,
+                ))
+            })
+            .unwrap();
 
         Ok(TimestampOracle { request_tx })
     }

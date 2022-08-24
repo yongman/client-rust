@@ -1,7 +1,7 @@
 // Copyright 2019 TiKV Project Authors. Licensed under Apache-2.0.
 
 use crate::{BoundRange, Key, KvPair, Result, Value};
-use futures::Stream;
+use futures::{future::BoxFuture, Stream};
 use std::{
     collections::{btree_map::Entry, BTreeMap, HashMap},
     convert::TryInto,
@@ -13,10 +13,9 @@ use tikv_client_proto::kvrpcpb;
 use tokio_stream::StreamExt;
 
 #[allow(dead_code)]
-pub struct KvPairStream<F, Fut>
+pub struct KvPairStream<F>
 where
-    F: FnOnce(BoundRange, u32) -> Fut + Clone,
-    Fut: Future<Output = Result<Vec<KvPair>>> + Unpin,
+    F: FnOnce(BoundRange, u32) -> BoxFuture<'static, Result<Vec<KvPair>>> + Clone,
 {
     batch_size: u32,
     current: usize,
@@ -30,17 +29,14 @@ where
     fetch_data: F,
 }
 
-impl<F, Fut> Unpin for KvPairStream<F, Fut>
-where
-    F: FnOnce(BoundRange, u32) -> Fut + Clone,
-    Fut: Future<Output = Result<Vec<KvPair>>> + Unpin,
+impl<F> Unpin for KvPairStream<F> where
+    F: FnOnce(BoundRange, u32) -> BoxFuture<'static, Result<Vec<KvPair>>> + Clone
 {
 }
 
-impl<F, Fut> Stream for KvPairStream<F, Fut>
+impl<F> Stream for KvPairStream<F>
 where
-    F: FnOnce(BoundRange, u32) -> Fut + Clone,
-    Fut: Future<Output = Result<Vec<KvPair>>> + Unpin,
+    F: FnOnce(BoundRange, u32) -> BoxFuture<'static, Result<Vec<KvPair>>> + Clone,
 {
     type Item = KvPair;
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<KvPair>> {
@@ -97,10 +93,9 @@ where
     }
 }
 
-impl<F, Fut> KvPairStream<F, Fut>
+impl<F> KvPairStream<F>
 where
-    F: FnOnce(BoundRange, u32) -> Fut + Clone,
-    Fut: Future<Output = Result<Vec<KvPair>>> + Unpin,
+    F: FnOnce(BoundRange, u32) -> BoxFuture<'static, Result<Vec<KvPair>>> + Clone,
 {
     pub fn new(range: BoundRange, limit: u32, reverse: bool, fetch_data: F) -> Self {
         let (start, end) = range.into_keys();
@@ -217,7 +212,7 @@ impl Buffer {
     }
 
     /// Run `f` to fetch entries in `range` from TiKV. Combine them with mutations in local buffer. Returns the results.
-    pub async fn scan_and_fetch<F, Fut>(
+    pub async fn scan_and_fetch<F>(
         &mut self,
         range: BoundRange,
         limit: u32,
@@ -226,8 +221,7 @@ impl Buffer {
         f: F,
     ) -> Result<impl Iterator<Item = KvPair>>
     where
-        F: FnOnce(BoundRange, u32) -> Fut + Clone,
-        Fut: Future<Output = Result<Vec<KvPair>>> + Unpin,
+        F: FnOnce(BoundRange, u32) -> BoxFuture<'static, Result<Vec<KvPair>>> + Clone,
     {
         // read from local buffer
         let mutation_range = self.entry_map.range(range.clone());

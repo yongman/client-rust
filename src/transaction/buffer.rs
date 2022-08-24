@@ -1,11 +1,122 @@
 // Copyright 2019 TiKV Project Authors. Licensed under Apache-2.0.
 
 use crate::{BoundRange, Key, KvPair, Result, Value};
+use futures::Stream;
 use std::{
     collections::{btree_map::Entry, BTreeMap, HashMap},
+    convert::TryInto,
     future::Future,
+    pin::Pin,
+    task::{Context, Poll},
 };
 use tikv_client_proto::kvrpcpb;
+use tokio_stream::StreamExt;
+
+#[allow(dead_code)]
+pub struct KvPairStream<F, Fut>
+where
+    F: FnOnce(BoundRange, u32) -> Fut + Clone,
+    Fut: Future<Output = Result<Vec<KvPair>>> + Unpin,
+{
+    batch_size: u32,
+    current: usize,
+    limit: u32,
+    cache: Vec<KvPair>,
+    next_start_key: Key,
+
+    next_end_key: Key,
+    reverse: bool,
+
+    fetch_data: F,
+}
+
+impl<F, Fut> Unpin for KvPairStream<F, Fut>
+where
+    F: FnOnce(BoundRange, u32) -> Fut + Clone,
+    Fut: Future<Output = Result<Vec<KvPair>>> + Unpin,
+{
+}
+
+impl<F, Fut> Stream for KvPairStream<F, Fut>
+where
+    F: FnOnce(BoundRange, u32) -> Fut + Clone,
+    Fut: Future<Output = Result<Vec<KvPair>>> + Unpin,
+{
+    type Item = KvPair;
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<KvPair>> {
+        if self.cache.is_empty() {
+            // scan ended
+            return Poll::Ready(None);
+        }
+
+        // try read from cache
+        // cache is consumed done, so we need to fetch new data from server, and fill the cache
+        if self.current >= self.cache.len() {
+            // scan ended, because cache is not full-filled in the last fetch
+            if self.cache.len() < self.batch_size.try_into().unwrap() {
+                return Poll::Ready(None);
+            }
+            // fill cache
+            // generate new bound range
+            let range = self.next_start_key.clone()..self.next_end_key.clone();
+            let bound_range: BoundRange = range.into();
+            let batch_size = if self.limit > self.batch_size {
+                self.batch_size
+            } else {
+                self.limit
+            };
+            let mut fut = (self.fetch_data.clone())(bound_range, batch_size);
+            let scan_batch_data = match Pin::new(&mut fut).poll(cx) {
+                Poll::Ready(Ok(v)) => v,
+                Poll::Ready(Err(_)) => return Poll::Ready(None),
+                Poll::Pending => return Poll::Pending,
+            };
+            self.cache = scan_batch_data;
+            if self.cache.is_empty() {
+                // scan ended
+                return Poll::Ready(None);
+            }
+
+            self.limit -= self.cache.len() as u32;
+            // reset current index to start
+            self.current = 0;
+
+            // update bound range for next fetch
+            let last_key = self.cache.last().map(|kv| kv.0.clone()).unwrap();
+            if !self.reverse {
+                self.next_start_key = last_key.next_key();
+            } else {
+                self.next_end_key = last_key;
+            }
+        }
+
+        let ret = self.cache[self.current].clone();
+
+        self.current += 1;
+        Poll::Ready(Some(ret))
+    }
+}
+
+impl<F, Fut> KvPairStream<F, Fut>
+where
+    F: FnOnce(BoundRange, u32) -> Fut + Clone,
+    Fut: Future<Output = Result<Vec<KvPair>>> + Unpin,
+{
+    pub fn new(range: BoundRange, limit: u32, reverse: bool, fetch_data: F) -> Self {
+        let (start, end) = range.into_keys();
+
+        KvPairStream {
+            batch_size: 256,
+            current: 0,
+            limit,
+            cache: Vec::with_capacity(256),
+            next_start_key: start,
+            next_end_key: end.unwrap_or(Key::EMPTY),
+            reverse,
+            fetch_data,
+        }
+    }
+}
 
 /// A caching layer which buffers reads and writes in a transaction.
 pub struct Buffer {
@@ -115,8 +226,8 @@ impl Buffer {
         f: F,
     ) -> Result<impl Iterator<Item = KvPair>>
     where
-        F: FnOnce(BoundRange, u32) -> Fut,
-        Fut: Future<Output = Result<Vec<KvPair>>>,
+        F: FnOnce(BoundRange, u32) -> Fut + Clone,
+        Fut: Future<Output = Result<Vec<KvPair>>> + Unpin,
     {
         // read from local buffer
         let mutation_range = self.entry_map.range(range.clone());
@@ -129,8 +240,12 @@ impl Buffer {
                 .filter(|(_, m)| matches!(m, BufferEntry::Del))
                 .count() as u32;
 
-        let mut results = f(range, redundant_limit)
-            .await?
+        let kv_stream = KvPairStream::new(range, redundant_limit, reverse, f);
+
+        let mut results = kv_stream
+            .map(|kv| kv)
+            .collect::<Vec<_>>()
+            .await
             .into_iter()
             .map(|pair| pair.into())
             .collect::<HashMap<Key, Value>>();

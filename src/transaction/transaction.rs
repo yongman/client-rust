@@ -714,17 +714,20 @@ impl<PdC: PdClient> Transaction<PdC> {
                 limit,
                 !key_only,
                 reverse,
-                move |new_range, new_limit| async move {
-                    let request =
-                        new_scan_request(new_range, timestamp, new_limit, key_only, reverse);
-                    let plan = PlanBuilder::new(rpc, request)
-                        .resolve_lock(retry_options.lock_backoff)
-                        .retry_multi_region(retry_options.region_backoff)
-                        .merge(Collect)
-                        .plan();
-                    plan.execute()
-                        .await
-                        .map(|r| r.into_iter().map(Into::into).collect())
+                move |new_range, new_limit| {
+                    async move {
+                        let request =
+                            new_scan_request(new_range, timestamp, new_limit, key_only, reverse);
+                        let plan = PlanBuilder::new(rpc, request)
+                            .resolve_lock(retry_options.lock_backoff)
+                            .retry_multi_region(retry_options.region_backoff)
+                            .merge(Collect)
+                            .plan();
+                        plan.execute()
+                            .await
+                            .map(|r| r.into_iter().map(Into::into).collect())
+                    }
+                    .boxed()
                 },
             )
             .await

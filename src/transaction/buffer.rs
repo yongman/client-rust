@@ -1,22 +1,29 @@
 // Copyright 2019 TiKV Project Authors. Licensed under Apache-2.0.
 
-use crate::{BoundRange, Key, KvPair, Result, Value};
-use futures::{future::BoxFuture, Stream};
+use crate::{
+    pd::{PdClient, PdRpcClient},
+    request::{Collect, Plan, PlanBuilder},
+    transaction_lowering::new_scan_request,
+    BoundRange, Key, KvPair, Result, RetryOptions, Value,
+};
+use futures::{FutureExt, Stream, StreamExt};
 use std::{
     collections::{btree_map::Entry, BTreeMap, HashMap},
     convert::TryInto,
     future::Future,
     pin::Pin,
+    sync::Arc,
     task::{Context, Poll},
 };
-use tikv_client_proto::kvrpcpb;
-use tokio_stream::StreamExt;
+use tikv_client_proto::{kvrpcpb, pdpb::Timestamp};
 
-#[allow(dead_code)]
-pub struct KvPairStream<F>
-where
-    F: FnOnce(BoundRange, u32) -> BoxFuture<'static, Result<Vec<KvPair>>> + Clone,
-{
+const DEFAULT_BATCH_SIZE: u32 = 256;
+
+pub struct KvPairStream<PdC: PdClient = PdRpcClient> {
+    pdc: Arc<PdC>,
+    timestamp: Timestamp,
+    range: BoundRange,
+
     batch_size: u32,
     current: usize,
     limit: u32,
@@ -25,48 +32,36 @@ where
 
     next_end_key: Key,
     reverse: bool,
-
-    fetch_data: F,
+    key_only: bool,
+    retry_options: RetryOptions,
 }
 
-impl<F> Unpin for KvPairStream<F> where
-    F: FnOnce(BoundRange, u32) -> BoxFuture<'static, Result<Vec<KvPair>>> + Clone
-{
-}
-
-impl<F> Stream for KvPairStream<F>
-where
-    F: FnOnce(BoundRange, u32) -> BoxFuture<'static, Result<Vec<KvPair>>> + Clone,
-{
+impl<PdC: PdClient> Stream for KvPairStream<PdC> {
     type Item = KvPair;
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<KvPair>> {
-        if self.cache.is_empty() {
-            // scan ended
-            return Poll::Ready(None);
-        }
-
         // try read from cache
         // cache is consumed done, so we need to fetch new data from server, and fill the cache
         if self.current >= self.cache.len() {
             // scan ended, because cache is not full-filled in the last fetch
-            if self.cache.len() < self.batch_size.try_into().unwrap() {
+            if !self.cache.is_empty() && self.cache.len() < self.batch_size.try_into().unwrap() {
                 return Poll::Ready(None);
             }
             // fill cache
             // generate new bound range
             let range = self.next_start_key.clone()..self.next_end_key.clone();
-            let bound_range: BoundRange = range.into();
-            let batch_size = if self.limit > self.batch_size {
-                self.batch_size
-            } else {
-                self.limit
+            self.range = range.into();
+            if self.limit < self.batch_size {
+                self.batch_size = self.limit;
             };
-            let mut fut = (self.fetch_data.clone())(bound_range, batch_size);
+
+            let mut fut = self.fetch_data().boxed();
             let scan_batch_data = match Pin::new(&mut fut).poll(cx) {
                 Poll::Ready(Ok(v)) => v,
                 Poll::Ready(Err(_)) => return Poll::Ready(None),
                 Poll::Pending => return Poll::Pending,
             };
+            drop(fut);
+
             self.cache = scan_batch_data;
             if self.cache.is_empty() {
                 // scan ended
@@ -93,23 +88,50 @@ where
     }
 }
 
-impl<F> KvPairStream<F>
-where
-    F: FnOnce(BoundRange, u32) -> BoxFuture<'static, Result<Vec<KvPair>>> + Clone,
-{
-    pub fn new(range: BoundRange, limit: u32, reverse: bool, fetch_data: F) -> Self {
-        let (start, end) = range.into_keys();
+impl<PdC: PdClient> KvPairStream<PdC> {
+    pub fn new(
+        timestamp: Timestamp,
+        range: BoundRange,
+        limit: u32,
+        pdc: Arc<PdC>,
+        reverse: bool,
+        key_only: bool,
+        retry_options: RetryOptions,
+    ) -> Self {
+        let (start, end) = range.clone().into_keys();
 
         KvPairStream {
-            batch_size: 256,
+            pdc,
+            timestamp,
+            range,
+            batch_size: DEFAULT_BATCH_SIZE,
             current: 0,
             limit,
-            cache: Vec::with_capacity(256),
+            cache: Vec::with_capacity(DEFAULT_BATCH_SIZE as usize),
             next_start_key: start,
             next_end_key: end.unwrap_or(Key::EMPTY),
             reverse,
-            fetch_data,
+            key_only,
+            retry_options,
         }
+    }
+
+    pub async fn fetch_data(&self) -> Result<Vec<KvPair>> {
+        let request = new_scan_request(
+            self.range.clone(),
+            self.timestamp.clone(),
+            self.batch_size,
+            self.key_only,
+            self.reverse,
+        );
+        let retry_options = self.retry_options.clone();
+        let plan = PlanBuilder::new(self.pdc.clone(), request)
+            .resolve_lock(retry_options.lock_backoff)
+            .retry_multi_region(retry_options.region_backoff)
+            .merge(Collect)
+            .plan();
+        let res = plan.execute().await;
+        res.map(|r| r.into_iter().map(Into::into).collect())
     }
 }
 
@@ -211,18 +233,18 @@ impl Buffer {
         Ok(results)
     }
 
-    /// Run `f` to fetch entries in `range` from TiKV. Combine them with mutations in local buffer. Returns the results.
-    pub async fn scan_and_fetch<F>(
+    /// Fetch entries in `range` from TiKV. Combine them with mutations in local buffer. Returns the results.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn scan_and_fetch<PdC: PdClient>(
         &mut self,
+        pdc: Arc<PdC>,
+        timestamp: Timestamp,
         range: BoundRange,
         limit: u32,
         update_cache: bool,
         reverse: bool,
-        f: F,
-    ) -> Result<impl Iterator<Item = KvPair>>
-    where
-        F: FnOnce(BoundRange, u32) -> BoxFuture<'static, Result<Vec<KvPair>>> + Clone,
-    {
+        retry_options: RetryOptions,
+    ) -> Result<impl Iterator<Item = KvPair>> {
         // read from local buffer
         let mutation_range = self.entry_map.range(range.clone());
 
@@ -234,7 +256,16 @@ impl Buffer {
                 .filter(|(_, m)| matches!(m, BufferEntry::Del))
                 .count() as u32;
 
-        let kv_stream = KvPairStream::new(range, redundant_limit, reverse, f);
+        // fetch entries from TiKV in batches
+        let kv_stream = KvPairStream::new(
+            timestamp,
+            range,
+            redundant_limit,
+            pdc,
+            reverse,
+            !update_cache,
+            retry_options,
+        );
 
         let mut results = kv_stream
             .map(|kv| kv)

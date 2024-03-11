@@ -85,7 +85,7 @@ impl<C: RetryClientTrait> RegionCache<C> {
                 .get(&candidate_region_ver_id)
                 .unwrap();
 
-            if region.contains(key) {
+            if region.contains(key) && region.leader.is_some() {
                 return Ok(region.clone());
             }
         }
@@ -102,7 +102,9 @@ impl<C: RetryClientTrait> RegionCache<C> {
             let ver_id = region_cache_guard.id_to_ver_id.get(&id);
             if let Some(ver_id) = ver_id {
                 let region = region_cache_guard.ver_id_to_region.get(ver_id).unwrap();
-                return Ok(region.clone());
+                if region.leader.is_some() {
+                    return Ok(region.clone());
+                }
             }
 
             // check concurrent requests

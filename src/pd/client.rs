@@ -68,6 +68,10 @@ pub trait PdClient: Send + Sync + 'static {
 
     async fn load_keyspace(&self, keyspace: &str) -> Result<keyspacepb::KeyspaceMeta>;
 
+    async fn store_addr_for_region_id(&self, id: RegionId) -> Result<String> {
+        Ok(String::new())
+    }
+
     /// In transactional API, `key` is in raw format
     async fn store_for_key(self: Arc<Self>, key: &Key) -> Result<RegionStore> {
         let region = self.region_for_key(key).await?;
@@ -253,6 +257,13 @@ impl<KvC: KvConnect + Send + Sync + 'static> PdClient for PdRpcClient<KvC> {
             stores.push(Store::new(Arc::new(client)));
         }
         Ok(stores)
+    }
+
+    async fn store_addr_for_region_id(&self, id: RegionId) -> Result<String> {
+        let region = self.region_cache.get_region_by_id(id).await?;
+        let store_id = region.get_store_id()?;
+        let store = self.region_cache.get_store_by_id(store_id).await?;
+        Ok(store.address.clone())
     }
 
     async fn get_timestamp(self: Arc<Self>) -> Result<Timestamp> {
